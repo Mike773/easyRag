@@ -8,7 +8,9 @@ from easyrag.llm.embeddings import EmbeddingClient
 
 def test_settings_load():
     s = get_settings()
-    assert s.embed_dim == 2560
+    assert s.embed_dim > 0
+    assert s.llm_provider in {"openai", "gigachat"}
+    assert s.embed_provider in {"openai", "gigachat"}
     assert "asyncpg" in s.db_dsn
 
 
@@ -61,7 +63,7 @@ async def test_embed_mock_dim_and_determinism():
     v1 = await e.embed_one("привет мир")
     v2 = await e.embed_one("привет мир")
     v3 = await e.embed_one("другой текст")
-    assert len(v1) == 2560
+    assert len(v1) == get_settings().embed_dim
     assert v1 == v2  # детерминированность
     assert v1 != v3  # разные тексты — разные векторы
     # норма ≈ 1
