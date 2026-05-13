@@ -2,8 +2,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-from pgvector.asyncpg import register_vector
-from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -16,15 +14,13 @@ from easyrag.config import get_settings
 
 @lru_cache(maxsize=1)
 def get_engine() -> AsyncEngine:
-    engine = create_async_engine(get_settings().db_dsn, pool_pre_ping=True)
-
-    # Регистрируем pgvector-кодек на каждом новом asyncpg-соединении пула.
-    # Без этого SELECT поля Vector упадёт: asyncpg не знает тип `vector`.
-    @event.listens_for(engine.sync_engine, "connect")
-    def _register_pgvector(dbapi_conn, _connection_record) -> None:
-        dbapi_conn.run_async(lambda c: register_vector(c))
-
-    return engine
+    # ВАЖНО: НЕ регистрируем `pgvector.asyncpg.register_vector` на соединениях
+    # этого engine. `pgvector.sqlalchemy.Vector.bind_processor` всегда отдаёт
+    # вектор строкой `'[..]'`, а бинарный кодек register_vector ждёт массив —
+    # вместе они дают `DataError: could not convert string to float` при INSERT.
+    # SQLAlchemy-результаты для Vector проходят через `_from_db`, который сам
+    # разбирает строковую форму, так что отдельный asyncpg-кодек не нужен.
+    return create_async_engine(get_settings().db_dsn, pool_pre_ping=True)
 
 
 @lru_cache(maxsize=1)

@@ -1,0 +1,113 @@
+"""Извлечение сущностей-кандидатов из текста через LLM.
+
+Тонкая обёртка над :class:`LLMClient` + промптами из :mod:`prompts`:
+зовёт tool ``save_entities`` и приводит ответ к списку :class:`ExtractedEntity`.
+
+Валидация (а не доверие модели на слово) важна потому, что:
+* GigaChat иногда возвращает statements как строку вместо массива;
+* у обоих провайдеров встречаются пустые ``name`` / дубликаты — их фильтруем,
+  чтобы не создавать мусорные строки в ``entity_candidate``.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from easyrag.ingest.prompts import (
+    ENTITY_EXTRACTION_SCHEMA,
+    ENTITY_EXTRACTION_SYSTEM,
+    ENTITY_EXTRACTION_TOOL_DESCRIPTION,
+    ENTITY_EXTRACTION_TOOL_NAME,
+    build_extraction_user_prompt,
+)
+from easyrag.llm.client import LLMClient, get_llm
+
+_MAX_STATEMENTS = 5
+
+
+@dataclass(frozen=True)
+class ExtractedEntity:
+    name: str
+    descriptor: str
+    statements: tuple[str, ...] = field(default_factory=tuple)
+
+
+async def extract_entities(
+    text: str,
+    *,
+    source_hint: str | None = None,
+    llm: LLMClient | None = None,
+) -> list[ExtractedEntity]:
+    """Извлечь сущности-кандидаты из ``text``.
+
+    Возвращает дедуплицированный список (по ``name`` без учёта регистра/пробелов).
+    Если модель вернула пустой список или мусор — возвращает пустой список,
+    исключение НЕ кидает: дальнейший пайплайн просто запишет чанк без кандидатов.
+    """
+    if not text or not text.strip():
+        return []
+    client = llm or get_llm()
+    raw = await client.call_json(
+        system=ENTITY_EXTRACTION_SYSTEM,
+        user=build_extraction_user_prompt(text, source_hint=source_hint),
+        tool_name=ENTITY_EXTRACTION_TOOL_NAME,
+        tool_description=ENTITY_EXTRACTION_TOOL_DESCRIPTION,
+        input_schema=ENTITY_EXTRACTION_SCHEMA,
+    )
+    return _coerce_entities(raw)
+
+
+def _coerce_entities(raw: dict[str, Any]) -> list[ExtractedEntity]:
+    items = raw.get("entities") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return []
+    out: list[ExtractedEntity] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_str(item.get("name"))
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        descriptor = _clean_str(item.get("descriptor"))
+        statements = _coerce_statements(item.get("statements"))
+        out.append(
+            ExtractedEntity(
+                name=name,
+                descriptor=descriptor,
+                statements=statements,
+            )
+        )
+    return out
+
+
+def _coerce_statements(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        # GigaChat иногда отдаёт всё одной строкой — оставляем как один statement.
+        cleaned = _clean_str(value)
+        return (cleaned,) if cleaned else ()
+    if not isinstance(value, list):
+        return ()
+    cleaned: list[str] = []
+    for s in value:
+        if not isinstance(s, str):
+            continue
+        s = _clean_str(s)
+        if s:
+            cleaned.append(s)
+        if len(cleaned) >= _MAX_STATEMENTS:
+            break
+    return tuple(cleaned)
+
+
+def _clean_str(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+__all__ = ["ExtractedEntity", "extract_entities"]
