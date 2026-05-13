@@ -13,8 +13,6 @@ import json
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import StructuredTool
-from pydantic import BaseModel
 
 from easyrag.config import Provider, get_settings
 
@@ -105,27 +103,22 @@ def _build_chat(settings: Any) -> Any:
     raise ValueError(f"Unknown llm_provider: {settings.llm_provider!r}")
 
 
-def _schema_to_tool(name: str, description: str, input_schema: dict[str, Any]) -> StructuredTool:
-    """Превратить «голую» JSON-схему в LangChain-инструмент.
+def _schema_to_tool(name: str, description: str, input_schema: dict[str, Any]) -> dict[str, Any]:
+    """Собрать tool в OpenAI-формате, отдавая JSON-схему без потерь.
 
-    Через ``args_schema`` LangChain передаёт схему как есть — это нужно, чтобы
-    OpenAI и GigaChat увидели одни и те же поля и required-ограничения.
+    `bind_tools` принимает dict в OpenAI-формате напрямую — это надёжнее,
+    чем строить pydantic-BaseModel-носитель схемы, потому что
+    `convert_to_openai_tool` иначе читает поля из `model_fields` и отдаёт
+    модели пустой `parameters`, даже если переопределён `model_json_schema`.
     """
-
-    class _SchemaCarrier(BaseModel):
-        @classmethod
-        def model_json_schema(cls, *_: Any, **__: Any) -> dict[str, Any]:  # type: ignore[override]
-            return input_schema
-
-    def _noop(**_: Any) -> dict[str, Any]:
-        return {}
-
-    return StructuredTool.from_function(
-        func=_noop,
-        name=name,
-        description=description,
-        args_schema=_SchemaCarrier,
-    )
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": input_schema,
+        },
+    }
 
 
 def _mock_response(

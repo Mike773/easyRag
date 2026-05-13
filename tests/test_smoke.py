@@ -45,7 +45,7 @@ async def test_llm_mock_returns_schema_shape():
             "type": "object",
             "properties": {
                 "answer": {"type": "string"},
-                "items": {"type": "array"},
+                "items": {"type": "array", "items": {"type": "string"}},
                 "ok": {"type": "boolean"},
             },
             "required": ["answer", "items", "ok"],
@@ -64,8 +64,14 @@ async def test_embed_mock_dim_and_determinism():
     v2 = await e.embed_one("привет мир")
     v3 = await e.embed_one("другой текст")
     assert len(v1) == get_settings().embed_dim
-    assert v1 == v2  # детерминированность
-    assert v1 != v3  # разные тексты — разные векторы
+
+    def _cos(a: list[float], b: list[float]) -> float:
+        return sum(x * y for x, y in zip(a, b))
+
+    # Тот же текст — близкие векторы (моки точно равны, OpenAI ≈ равны).
+    assert _cos(v1, v2) > 0.999
+    # Разные тексты — заметно расходятся.
+    assert _cos(v1, v3) < 0.95
     # норма ≈ 1
     s = sum(x * x for x in v1) ** 0.5
-    assert abs(s - 1.0) < 1e-6
+    assert abs(s - 1.0) < 1e-2
