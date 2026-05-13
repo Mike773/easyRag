@@ -1,27 +1,33 @@
-"""Обёртка над Anthropic Claude.
+"""LLM-обёртка поверх LangChain.
 
-Структурированный вывод реализуется через tool use: модель «вызывает» tool с
-заданной JSON-схемой, мы возвращаем его аргументы. Это надёжнее, чем парсить
-свободный JSON из текста.
+Поддерживаются два провайдера, выбираемых через ``settings.llm_provider``:
+* ``openai``   — ``langchain_openai.ChatOpenAI`` (любой OpenAI-совместимый endpoint).
+* ``gigachat`` — ``langchain_gigachat.GigaChat``.
+
+Структурированный вывод реализуется через tool-binding LangChain: модель «вызывает»
+tool с заданной JSON-схемой, мы возвращаем его аргументы. Это надёжнее, чем парсить
+свободный JSON из текста, и единообразно работает у обоих провайдеров.
 """
 import hashlib
 import json
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel
 
-from easyrag.config import get_settings
+from easyrag.config import Provider, get_settings
 
 
 class LLMClient:
     def __init__(self) -> None:
         settings = get_settings()
         self._mock = settings.llm_mock
-        self._model = settings.llm_model
+        self._provider: Provider = settings.llm_provider
+        self._model_name = settings.llm_model
         self._max_tokens = settings.llm_max_tokens
-        self._client: AsyncAnthropic | None = None
-        if not self._mock:
-            self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        self._temperature = settings.llm_temperature
+        self._chat: Any = None if self._mock else _build_chat(settings)
 
     async def call_json(
         self,
@@ -36,26 +42,90 @@ class LLMClient:
         if self._mock:
             return _mock_response(tool_name, system, user, input_schema)
 
-        if self._client is None:
-            raise RuntimeError("LLMClient is in mock mode; real API client not initialised")
-        response = await self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            tools=[
-                {
-                    "name": tool_name,
-                    "description": tool_description,
-                    "input_schema": input_schema,
-                }
-            ],
-            tool_choice={"type": "tool", "name": tool_name},
-        )
-        for block in response.content:
-            if block.type == "tool_use" and block.name == tool_name:
-                return dict(block.input)
-        raise RuntimeError(f"LLM не вызвал tool {tool_name}: {response.content!r}")
+        if self._chat is None:
+            raise RuntimeError("LLMClient is in mock mode; real client not initialised")
+
+        tool = _schema_to_tool(tool_name, tool_description, input_schema)
+        bound = self._chat.bind_tools([tool], tool_choice=tool_name)
+        messages = [SystemMessage(content=system), HumanMessage(content=user)]
+        response = await bound.ainvoke(messages)
+
+        for call in getattr(response, "tool_calls", None) or []:
+            if call.get("name") == tool_name:
+                return dict(call.get("args") or {})
+
+        # Фолбэк: некоторые провайдеры (в т.ч. GigaChat) кладут аргументы
+        # в additional_kwargs.function_call.arguments.
+        extra = getattr(response, "additional_kwargs", {}) or {}
+        fn = extra.get("function_call")
+        if fn and fn.get("name") == tool_name:
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    return json.loads(args)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"LLM вернул не-JSON аргументы tool {tool_name}: {args!r}"
+                    ) from exc
+            if isinstance(args, dict):
+                return dict(args)
+
+        raise RuntimeError(f"LLM не вызвал tool {tool_name}: {response!r}")
+
+
+def _build_chat(settings: Any) -> Any:
+    """Сконструировать LangChain-чат под выбранного провайдера."""
+    if settings.llm_provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        kwargs: dict[str, Any] = {
+            "model": settings.llm_model,
+            "temperature": settings.llm_temperature,
+            "max_tokens": settings.llm_max_tokens,
+        }
+        if settings.openai_api_key:
+            kwargs["api_key"] = settings.openai_api_key
+        if settings.openai_base_url:
+            kwargs["base_url"] = settings.openai_base_url
+        return ChatOpenAI(**kwargs)
+
+    if settings.llm_provider == "gigachat":
+        from langchain_gigachat import GigaChat
+
+        kwargs = {
+            "model": settings.llm_model,
+            "credentials": settings.gigachat_credentials,
+            "scope": settings.gigachat_scope,
+            "verify_ssl_certs": settings.gigachat_verify_ssl,
+            "temperature": settings.llm_temperature,
+            "max_tokens": settings.llm_max_tokens,
+        }
+        return GigaChat(**kwargs)
+
+    raise ValueError(f"Unknown llm_provider: {settings.llm_provider!r}")
+
+
+def _schema_to_tool(name: str, description: str, input_schema: dict[str, Any]) -> StructuredTool:
+    """Превратить «голую» JSON-схему в LangChain-инструмент.
+
+    Через ``args_schema`` LangChain передаёт схему как есть — это нужно, чтобы
+    OpenAI и GigaChat увидели одни и те же поля и required-ограничения.
+    """
+
+    class _SchemaCarrier(BaseModel):
+        @classmethod
+        def model_json_schema(cls, *_: Any, **__: Any) -> dict[str, Any]:  # type: ignore[override]
+            return input_schema
+
+    def _noop(**_: Any) -> dict[str, Any]:
+        return {}
+
+    return StructuredTool.from_function(
+        func=_noop,
+        name=name,
+        description=description,
+        args_schema=_SchemaCarrier,
+    )
 
 
 def _mock_response(
@@ -95,7 +165,7 @@ def _empty_value(schema: dict[str, Any], seed: str) -> Any:
     return None
 
 
-__all__ = ["LLMClient"]
+__all__ = ["LLMClient", "get_llm", "set_llm_for_tests", "reset_llm", "dump_prompt"]
 
 
 # Сахар для тестов — переопределяемая фабрика.

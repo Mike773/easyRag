@@ -1,27 +1,29 @@
-"""HTTP-клиент эмбеддингов (OpenAI-совместимый формат /v1/embeddings).
+"""Эмбеддинги поверх LangChain.
 
-Размерность фиксируется через config.embed_dim (по умолчанию 2560 — Qwen3-Embedding-4B).
+Поддерживаются два провайдера, выбираемых через ``settings.embed_provider``:
+* ``openai``   — ``langchain_openai.OpenAIEmbeddings`` (любой OpenAI-совместимый endpoint).
+* ``gigachat`` — ``langchain_gigachat.GigaChatEmbeddings``.
+
+Размерность фиксируется через ``settings.embed_dim``. В реальном режиме мы доверяем
+ответу провайдера; в mock-режиме генерируем детерминированный нормированный вектор
+заявленной размерности — для офлайн-тестов.
 """
+import asyncio
 import hashlib
 import math
 from typing import Any
 
-import httpx
-
-from easyrag.config import get_settings
+from easyrag.config import Provider, get_settings
 
 
 class EmbeddingClient:
     def __init__(self) -> None:
         s = get_settings()
         self._mock = s.embed_mock
-        self._url = s.embed_url
+        self._provider: Provider = s.embed_provider
         self._model = s.embed_model
         self._dim = s.embed_dim
-        headers = {"Content-Type": "application/json"}
-        if s.embed_api_key:
-            headers["Authorization"] = f"Bearer {s.embed_api_key}"
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), headers=headers)
+        self._embedder: Any = None if self._mock else _build_embedder(s)
 
     @property
     def dim(self) -> int:
@@ -37,21 +39,54 @@ class EmbeddingClient:
         if self._mock:
             return [_deterministic_vector(t, self._dim) for t in texts]
 
-        payload: dict[str, Any] = {"model": self._model, "input": texts}
-        resp = await self._client.post(self._url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        # OpenAI-совместимый ответ: {"data": [{"embedding": [...]}, ...]}
-        return [item["embedding"] for item in data["data"]]
+        if self._embedder is None:
+            raise RuntimeError("EmbeddingClient is in mock mode; real client not initialised")
+
+        # LangChain Embeddings: предпочитаем aembed_documents, иначе fallback в thread.
+        aembed = getattr(self._embedder, "aembed_documents", None)
+        if aembed is not None:
+            return await aembed(texts)
+        return await asyncio.to_thread(self._embedder.embed_documents, texts)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        # У LangChain-эмбеддингов нет общего close(); httpx-клиенты внутри
+        # ChatOpenAI/GigaChat закрываются на финализаторе.
+        return None
 
     async def __aenter__(self) -> "EmbeddingClient":
         return self
 
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
+
+
+def _build_embedder(settings: Any) -> Any:
+    if settings.embed_provider == "openai":
+        from langchain_openai import OpenAIEmbeddings
+
+        kwargs: dict[str, Any] = {"model": settings.embed_model}
+        if settings.embed_api_key:
+            kwargs["api_key"] = settings.embed_api_key
+        if settings.embed_base_url:
+            kwargs["base_url"] = settings.embed_base_url
+        # Если задана нестандартная размерность — попросим её у API
+        # (поддерживается моделями text-embedding-3-*).
+        if settings.embed_dim:
+            kwargs["dimensions"] = settings.embed_dim
+        return OpenAIEmbeddings(**kwargs)
+
+    if settings.embed_provider == "gigachat":
+        from langchain_gigachat import GigaChatEmbeddings
+
+        kwargs = {
+            "model": settings.embed_model,
+            "credentials": settings.gigachat_credentials,
+            "scope": settings.gigachat_scope,
+            "verify_ssl_certs": settings.gigachat_verify_ssl,
+        }
+        return GigaChatEmbeddings(**kwargs)
+
+    raise ValueError(f"Unknown embed_provider: {settings.embed_provider!r}")
 
 
 def _deterministic_vector(text: str, dim: int) -> list[float]:
