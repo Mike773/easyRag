@@ -11,13 +11,20 @@
 * :func:`ingest_text` — оркестратор: пишет ``source_doc`` + чанки + кандидатов в БД.
 """
 from easyrag.ingest.chunker import Chunk, chunk_text
-from easyrag.ingest.extractor import ExtractedEntity, extract_entities
+from easyrag.ingest.extractor import (
+    DocumentBrief,
+    ExtractedEntity,
+    analyze_document,
+    extract_entities,
+)
 from easyrag.ingest.pipeline import IngestResult, ingest_text
 
 __all__ = [
     "Chunk",
+    "DocumentBrief",
     "ExtractedEntity",
     "IngestResult",
+    "analyze_document",
     "chunk_text",
     "extract_entities",
     "ingest_text",

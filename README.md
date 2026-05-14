@@ -4,7 +4,7 @@ Wiki-first RAG для бизнес-документации. CLI-only, без HT
 
 **Стек:** Python 3.11 · SQLAlchemy 2.0 (async) · PostgreSQL + pgvector · LangChain поверх OpenAI и GigaChat (tool-binding для структурированного вывода) · эмбеддинги через `OpenAIEmbeddings` / `GigaChatEmbeddings`.
 
-**Статус:** pre-alpha / шаг 0 — скелет проекта (config, db-модели, LLM/embed клиенты, миграции, smoke-тесты). Пайплайны ingest / query / enrichment / typing будут добавлены на последующих шагах.
+**Статус:** pre-alpha / шаг 4 — ingest (чанки + кандидаты сущностей) с авто-резолвом в wiki через LLM-merge, query-пайплайн с retrieval (vector + graph expansion) и провенансом. Дальше: шаг 3 (аббревиатуры), шаг 5 (enrichment), шаг 6 (типизация).
 
 ## Идея
 
@@ -77,28 +77,41 @@ src/easyrag/
   config.py        # настройки из env (pydantic-settings)
   db/              # модели + асинхронная сессия
   llm/             # LangChain-клиенты LLM + embeddings (openai/gigachat, mock-режим)
-  cli.py           # Click CLI (заглушка на шаге 0)
-  wiki/            # markdown, link index (шаг 1, планируется)
-  ingest/          # пайплайн загрузки (шаг 2, планируется)
+  cli.py           # Click CLI (ingest, query)
+  wiki/            # markdown, link index (шаг 1)
+  ingest/          # пайплайн загрузки (шаг 2; на шаге 4 — авто-резолв в wiki)
+  query/           # resolver + retrieval + answer (шаг 4)
   abbreviations/   # словарь и query-expand (шаг 3, планируется)
-  query/           # retrieval + answer (шаг 4, планируется)
   enrichment/      # gap loop (шаг 5, планируется)
   typing_/         # эмерджентные типы (шаг 6, планируется)
 ```
 
-## CLI (планируется)
+## CLI
 
-На шагах 2/4/5/6 появятся команды:
+Сейчас доступны команды `status`, `ingest`, `query`:
 
 ```
-easyrag ingest --uri <name> --file path/to/text.txt
-easyrag query "ваш вопрос"
-easyrag enrich --limit 50
-easyrag retype
-easyrag resolve-abbr
+easyrag status
+easyrag ingest --uri contracts/7 --file path/to/text.txt
+easyrag query "ваш вопрос" [--top-k 8] [--no-graph] [--no-show-sources]
 ```
 
-Сейчас доступна только `easyrag status` — выводит, что CLI пока не реализован.
+`ingest` после извлечения сущностей автоматически резолвит кандидатов в
+`wiki_page` через LLM-merge (можно отключить флагом `--no-resolve` — тогда
+кандидаты останутся в `entity_candidate` без материализации). Слияние:
+кандидат по вектору `name. descriptor` ищет ближайшую wiki-страницу; при
+similarity ≥ `EASYRAG_RESOLVE_THRESH_HIGH` (0.85 по умолчанию) — вливается в
+существующую, при similarity между `RESOLVE_THRESH_LOW` (0.65) и high —
+помечается ambiguous и не материализуется, иначе создаётся новая страница.
+
+`query` эмбеддит вопрос, делает top-K cosine-поиск по `wiki_section`,
+расширяется по `wiki_link` (порог `EASYRAG_GRAPH_EXPAND_THRESH`, 0.55), просит
+LLM ответить только по контексту с цитатами `slug#anchor`, после чего
+печатает ответ и `section_provenance` (uri исходного документа + char-offset'ы).
+Каждый запрос пишется в `query_gap`; если ни одна секция не дала валидной
+цитаты — запись остаётся неразрешённой (сырьё для шага 5).
+
+Команды `enrich`, `retype`, `resolve-abbr` появятся на шагах 5/6/3.
 
 ## Тесты
 

@@ -1,17 +1,92 @@
 """Промпты для шага 2 (ingest).
 
-Сейчас здесь только один промпт — извлечение сущностей-кандидатов из чанка.
-Выход модели — JSON со списком ``entities`` (см. :data:`ENTITY_EXTRACTION_SCHEMA`),
-который ложится 1-в-1 на таблицу ``entity_candidate``: ``name`` / ``descriptor`` /
-``statements``.
+Здесь два промпта:
 
-Контракт намеренно консервативный: модель НЕ должна резолвить ссылки между
-сущностями (это сделает шаг 4) и НЕ должна додумывать факты — каждое утверждение
+* ``DOC_BRIEF_*`` — анализ документа целиком (или его начала): даёт краткое
+  описание содержимого и **самокалибровку**, какие классы сущностей в этом
+  документе осмысленно выделять. Результат — :class:`DocumentBrief` — потом
+  подаётся как контекст в extraction.
+* ``ENTITY_EXTRACTION_*`` — извлечение сущностей-кандидатов из конкретного
+  чанка. Промпт намеренно доменно-агностичный: никаких упоминаний жанра
+  документа, никаких списков ожидаемых типов, никаких примеров.
+
+Контракт extraction'а консервативный: модель НЕ резолвит ссылки между
+сущностями (это сделает шаг 4) и НЕ додумывает факты — каждое утверждение
 обязано опираться на конкретный фрагмент чанка.
 """
 from __future__ import annotations
 
 from typing import Any
+
+# ---------- Document brief ----------
+
+DOC_BRIEF_TOOL_NAME = "save_document_brief"
+DOC_BRIEF_TOOL_DESCRIPTION = (
+    "Сохранить краткий профиль документа: о чём он и какие классы объектов "
+    "являются носителями смысла именно в этом документе. Вызвать ровно один раз."
+)
+
+DOC_BRIEF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": (
+                "Одно-два коротких предложения о том, что это за документ и о чём он. "
+                "Без оценок, без догадок, без додуманных фактов — только то, что видно из текста."
+            ),
+        },
+        "entity_types": {
+            "type": "array",
+            "description": (
+                "Классы объектов, которые в ЭТОМ конкретном документе являются "
+                "носителями смысла и которые имеет смысл индексировать как отдельные "
+                "сущности. Классы предлагаешь ты сам, исходя из содержимого. "
+                "Названия классов — короткие, по-русски, во множественном числе, "
+                "без конкретных имён. Если уверенно ничего выделить нельзя — "
+                "верни пустой массив."
+            ),
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["summary", "entity_types"],
+    "additionalProperties": False,
+}
+
+DOC_BRIEF_SYSTEM = (
+    "Перед тобой произвольный документ на русском языке. Твоя задача — "
+    "построить короткий профиль документа для последующего извлечения сущностей.\n"
+    "\n"
+    "Действуй так:\n"
+    "1. Прочитай фрагмент и пойми, что это за документ. Не угадывай за пределами текста.\n"
+    "2. Определи, какие классы объектов в этом документе являются носителями смысла "
+    "и стоят отдельной wiki-страницы. Классы предложи сам: ориентируйся на то, "
+    "что фактически упоминается в тексте.\n"
+    "\n"
+    "Строгие правила:\n"
+    "— Не подгоняй ответ под заранее ожидаемые шаблоны (бизнес, технический, художественный — это твоё дело сообразить из текста).\n"
+    "— Названия классов в entity_types — обобщённые (множественное число, без артиклей), никаких конкретных имён, названий, цитат.\n"
+    "— Не выдумывай классы, которых в тексте нет.\n"
+    "— Ответ — только через вызов tool save_document_brief. Свободный текст игнорируется."
+)
+
+
+def build_brief_user_prompt(text: str, *, source_hint: str | None = None) -> str:
+    """Собрать user-сообщение для построения профиля документа."""
+    cleaned = (text or "").strip()
+    parts: list[str] = []
+    if source_hint:
+        parts.append(f"Источник: {source_hint.strip()}")
+    parts.append("Содержимое документа (или его начало) находится между тегами <document>:")
+    parts.append(f"<document>\n{cleaned}\n</document>")
+    parts.append(
+        "Построй профиль документа по правилам системного сообщения и верни его "
+        "вызовом tool save_document_brief."
+    )
+    return "\n\n".join(parts)
+
+
+# ---------- Entity extraction ----------
 
 ENTITY_EXTRACTION_TOOL_NAME = "save_entities"
 ENTITY_EXTRACTION_TOOL_DESCRIPTION = (
@@ -26,7 +101,7 @@ ENTITY_EXTRACTION_SCHEMA: dict[str, Any] = {
             "type": "array",
             "description": (
                 "Сущности, явно упомянутые в данном фрагменте. "
-                "Если фрагмент не содержит ни одной именованной сущности — верни пустой список."
+                "Если фрагмент не содержит ни одной сущности — верни пустой список."
             ),
             "items": {
                 "type": "object",
@@ -34,9 +109,9 @@ ENTITY_EXTRACTION_SCHEMA: dict[str, Any] = {
                     "name": {
                         "type": "string",
                         "description": (
-                            "Канонический человекочитаемый ярлык сущности из текста "
-                            "(например, 'ООО «Ромашка»', 'Договор поставки № 12'). "
-                            "Без кавычек-обёрток, без markdown."
+                            "Канонический человекочитаемый ярлык сущности — наиболее полное "
+                            "из встретившихся во фрагменте обозначений. Без кавычек-обёрток, "
+                            "без markdown."
                         ),
                     },
                     "descriptor": {
@@ -73,20 +148,14 @@ ENTITY_EXTRACTION_SCHEMA: dict[str, Any] = {
 
 
 ENTITY_EXTRACTION_SYSTEM = (
-    "Ты извлекаешь сущности-кандидаты из фрагмента бизнес-документа на русском языке "
+    "Ты извлекаешь сущности-кандидаты из фрагмента документа на русском языке "
     "для построения внутренней wiki. Это часть RAG-пайплайна: твой вывод напрямую "
     "пишется в БД и потом используется для сборки страниц.\n"
     "\n"
-    "ЧТО СЧИТАЕТСЯ СУЩНОСТЬЮ:\n"
-    "— организации, продукты, проекты, документы, договоры, должности, системы, "
-    "процессы, регламенты, термины — всё, чему имеет смысл завести отдельную "
-    "wiki-страницу.\n"
-    "\n"
-    "ЧТО НЕ СЧИТАЕТСЯ СУЩНОСТЬЮ:\n"
-    "— даты, числа, валюты сами по себе;\n"
-    "— общие слова ('сотрудник', 'клиент', 'отдел') без конкретного имени;\n"
-    "— местоимения и анафоры;\n"
-    "— оформление документа (главы, пункты, оглавление).\n"
+    "Что считать сущностью — определяется ПРОФИЛЕМ ДОКУМЕНТА, который придёт в "
+    "user-сообщении (поле 'Сущностями в этом документе считаются'). Если профиль "
+    "не передан — ориентируйся на то, какие объекты во фрагменте являются "
+    "носителями смысла и стоят отдельной wiki-страницы.\n"
     "\n"
     "ЖЁСТКИЕ ПРАВИЛА:\n"
     "1. Используй ТОЛЬКО факты, явно присутствующие во фрагменте. Никаких догадок, "
@@ -106,15 +175,26 @@ ENTITY_EXTRACTION_SYSTEM = (
 )
 
 
-def build_extraction_user_prompt(text: str, *, source_hint: str | None = None) -> str:
+def build_extraction_user_prompt(
+    text: str,
+    *,
+    source_hint: str | None = None,
+    domain_brief: "DocumentBriefView | None" = None,
+) -> str:
     """Собрать user-сообщение для извлечения сущностей из конкретного чанка.
 
     ``source_hint`` — необязательное короткое имя источника (например, имя файла);
     помогает модели не путаться, если в чанке нет очевидных маркеров происхождения.
 
-    Обёртка для текста — XML-тег ``<fragment>...</fragment>``: в бизнес-прозе
-    такие теги не встречаются, поэтому риск, что границу обёртки «подделает»
-    сам контент чанка, ниже, чем с тройными кавычками.
+    ``domain_brief`` — профиль документа (объект с атрибутами ``summary``,
+    ``entity_types``, ``non_entities``), построенный ранее одним вызовом
+    :func:`analyze_document`. Если задан — инжектится перед фрагментом, чтобы
+    модель калибровалась под фактический жанр документа. Если ``None`` —
+    extraction идёт в режиме «без подсказок», поведение остаётся универсальным.
+
+    Обёртка для текста — XML-тег ``<fragment>...</fragment>``: в естественной
+    прозе такие теги не встречаются, поэтому риск, что границу обёртки
+    «подделает» сам контент чанка, ниже, чем с тройными кавычками.
 
     Контракт: вызывающий код фильтрует пустые/whitespace-only тексты ДО вызова
     LLM. Эта функция не проверяет это сама — она просто формирует строку.
@@ -123,6 +203,10 @@ def build_extraction_user_prompt(text: str, *, source_hint: str | None = None) -
     parts: list[str] = []
     if source_hint:
         parts.append(f"Источник: {source_hint.strip()}")
+    if domain_brief is not None:
+        brief_block = _format_brief_block(domain_brief)
+        if brief_block:
+            parts.append(brief_block)
     parts.append("Фрагмент документа находится между тегами <fragment>:")
     parts.append(f"<fragment>\n{cleaned}\n</fragment>")
     parts.append(
@@ -132,10 +216,39 @@ def build_extraction_user_prompt(text: str, *, source_hint: str | None = None) -
     return "\n\n".join(parts)
 
 
+def _format_brief_block(brief: "DocumentBriefView") -> str:
+    summary = (getattr(brief, "summary", "") or "").strip()
+    entity_types = [t.strip() for t in (getattr(brief, "entity_types", ()) or ()) if t and t.strip()]
+    if not summary and not entity_types:
+        return ""
+    lines = ["Профиль документа:"]
+    if summary:
+        lines.append(f"- О чём: {summary}")
+    if entity_types:
+        lines.append("- Сущностями в этом документе считаются: " + ", ".join(entity_types))
+    return "\n".join(lines)
+
+
+# Type alias for static analysis only — DocumentBrief живёт в extractor,
+# но prompts.py использует только duck-typed view. Импорт делаем под TYPE_CHECKING,
+# чтобы не плодить циклические зависимости.
+from typing import TYPE_CHECKING  # noqa: E402
+
+if TYPE_CHECKING:
+    from easyrag.ingest.extractor import DocumentBrief as DocumentBriefView  # noqa: F401
+else:
+    DocumentBriefView = Any  # type: ignore[misc, assignment]
+
+
 __all__ = [
+    "DOC_BRIEF_SCHEMA",
+    "DOC_BRIEF_SYSTEM",
+    "DOC_BRIEF_TOOL_DESCRIPTION",
+    "DOC_BRIEF_TOOL_NAME",
     "ENTITY_EXTRACTION_SCHEMA",
     "ENTITY_EXTRACTION_SYSTEM",
     "ENTITY_EXTRACTION_TOOL_DESCRIPTION",
     "ENTITY_EXTRACTION_TOOL_NAME",
+    "build_brief_user_prompt",
     "build_extraction_user_prompt",
 ]

@@ -68,6 +68,33 @@ class ParsedPage:
     links: tuple[ExtractedLink, ...]
 
 
+def strip_self_links(text: str, *, page_slug: str) -> str:
+    """Убрать из ``text`` ссылки ``[[X]]`` / ``[[X|Y]]``, где ``make_slug(X)``
+    совпадает со slug'ом этой же страницы.
+
+    Защита от того, что LLM ссылается на саму страницу, которую составляет —
+    такие ссылки портят граф (self-loop) и читаются как мусор. Display заменяется
+    на читаемый текст: ``[[Колобок]]`` → ``Колобок``, ``[[Колобок|колобка]]`` →
+    ``колобка``. Code-блоки маскируются, как в :func:`extract_links`, поэтому
+    `[[X]]` внутри ``` или `…` остаётся нетронутым.
+    """
+    if not text or not page_slug:
+        return text
+    masked = _mask_code(text)
+    out: list[str] = []
+    last_end = 0
+    for m in _LINK_RE.finditer(masked):
+        target = m.group(1).strip()
+        if not target or make_slug(target) != page_slug:
+            continue
+        display = (m.group(2) or target).strip() if m.group(2) else target
+        out.append(text[last_end : m.start()])
+        out.append(display)
+        last_end = m.end()
+    out.append(text[last_end:])
+    return "".join(out)
+
+
 def extract_links(text: str) -> list[ExtractedLink]:
     """Найти все ``[[...]]`` в тексте в порядке появления.
 
@@ -137,4 +164,5 @@ __all__ = [
     "ParsedSection",
     "extract_links",
     "parse_page",
+    "strip_self_links",
 ]

@@ -39,6 +39,9 @@ class SourceDoc(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
     sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    # JSON-сериализованный DocumentBrief (см. easyrag.ingest.extractor).
+    # NULL — если brief построить не удалось; extraction продолжается без подсказок.
+    domain_brief: Mapped[str | None] = mapped_column(Text)
 
 
 class SourceChunk(Base):
