@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     abbr_thresh_high: float = 0.80
     graph_expand_thresh: float = 0.55
 
+    # Сколько символов от начала документа подавать в analyze_document
+    # для построения domain brief. Brief считается один раз на ingest.
+    doc_brief_window: int = 4000
+
+    # Сколько уже существующих страниц передавать в merge-prompt как каталог
+    # сущностей, на которые LLM должен ссылаться через [[…]]. На больших wiki
+    # имеет смысл отбирать top-K по similarity — пока считаем, что для текущего
+    # масштаба простой лимит достаточен.
+    merge_catalog_limit: int = 300
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

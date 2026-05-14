@@ -36,6 +36,7 @@ def upgrade() -> None:
         sa.Column("mime", sa.String(64)),
         sa.Column("ingested_at", sa.TIMESTAMP(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("sha256", sa.String(64)),
+        sa.Column("domain_brief", sa.Text),
     )
     op.create_index("ix_source_doc_sha256", "source_doc", ["sha256"])
 

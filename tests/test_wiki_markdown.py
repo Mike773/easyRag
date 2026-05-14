@@ -8,10 +8,11 @@ from easyrag.wiki import (
     make_slug,
     parse_page,
 )
+from easyrag.wiki.markdown import strip_self_links
 
 
 def test_make_slug_basic():
-    assert make_slug("Договор поставки № 1") == "dogovor-postavki-no-1"
+    assert make_slug("Договор поставки № 1") == "договор-поставки-no-1"
     assert make_slug("GigaChat & OpenAI") == "gigachat-openai"
     assert make_slug("hello   world") == "hello-world"
 
@@ -30,8 +31,8 @@ def test_make_slug_empty_fallbacks_to_stable_hash():
 def test_extract_links_simple():
     links = extract_links("см. [[Договор]] и [[Контрагент|поставщик]] подробнее")
     assert links == [
-        ExtractedLink(target="Договор", display="Договор", to_slug="dogovor"),
-        ExtractedLink(target="Контрагент", display="поставщик", to_slug="kontragent"),
+        ExtractedLink(target="Договор", display="Договор", to_slug="договор"),
+        ExtractedLink(target="Контрагент", display="поставщик", to_slug="контрагент"),
     ]
 
 
@@ -52,7 +53,7 @@ def test_parse_page_h2_sections_and_overview():
     titles = [s.title for s in page.sections]
     anchors = [s.anchor for s in page.sections]
     assert titles == ["Overview", "Стороны", "Сроки"]
-    assert anchors == ["overview", "storony", "sroki"]
+    assert anchors == ["overview", "стороны", "сроки"]
     # ord — последовательный от 0
     assert [s.ord for s in page.sections] == [0, 1, 2]
     # ссылки извлечены и нумерация общестраничная сохраняет порядок
@@ -63,7 +64,7 @@ def test_parse_page_h2_sections_and_overview():
 def test_parse_page_anchor_collision_suffix():
     body = "## Раздел\n\nA\n\n## Раздел\n\nB\n\n## Раздел\n\nC\n"
     page = parse_page(body)
-    assert [s.anchor for s in page.sections] == ["razdel", "razdel-2", "razdel-3"]
+    assert [s.anchor for s in page.sections] == ["раздел", "раздел-2", "раздел-3"]
 
 
 def test_parse_page_no_h2_treats_body_as_overview():
@@ -129,6 +130,37 @@ def test_parse_page_ignores_links_inside_inline_code():
     assert [link.target for link in sec.links] == ["Реальная"]
     # body_md по-прежнему хранит inline-код целиком.
     assert "`[[Target]]`" in sec.body_md
+
+
+def test_strip_self_links_removes_matching_target():
+    body = "[[Колобок]] катится по дороге и встречает [[Лиса]]."
+    out = strip_self_links(body, page_slug="колобок")
+    assert out == "Колобок катится по дороге и встречает [[Лиса]]."
+
+
+def test_strip_self_links_uses_display_when_aliased():
+    body = "ссылка [[Колобок|колобка]] съели."
+    out = strip_self_links(body, page_slug="колобок")
+    assert out == "ссылка колобка съели."
+
+
+def test_strip_self_links_keeps_other_links():
+    body = "[[Лиса]] съела [[Колобок]]."
+    out = strip_self_links(body, page_slug="лиса")
+    assert out == "Лиса съела [[Колобок]]."
+
+
+def test_strip_self_links_ignores_links_inside_code():
+    body = "В коде написано `[[Колобок]]`, а [[Колобок]] в обычном тексте — самореф."
+    out = strip_self_links(body, page_slug="колобок")
+    # Inline-код остался нетронутым, обычный [[Колобок]] схлопнулся.
+    assert "`[[Колобок]]`" in out
+    assert "Колобок в обычном тексте" in out
+
+
+def test_strip_self_links_no_slug_returns_text_unchanged():
+    body = "[[Что-то]]"
+    assert strip_self_links(body, page_slug="") == body
 
 
 def test_parse_page_unterminated_fence_is_left_as_text():
