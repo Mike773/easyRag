@@ -61,9 +61,11 @@ from easyrag.query.prompts import (
     build_merge_user_prompt,
 )
 from easyrag.wiki.markdown import make_slug, strip_self_links
+from easyrag.wiki.merge_utils import (
+    load_existing_catalog,
+    reembed_sections,
+)
 from easyrag.wiki.repository import upsert_page
-
-_EMBED_BATCH_SIZE = 128
 
 # Аннотация целевой страницы при резолве кандидата.
 #   target == "new"        → создаём новую страницу с slug = candidate_slug
@@ -179,27 +181,6 @@ async def resolve_candidates(
         ambiguous_candidate_ids=tuple(ambiguous_ids),
         resolved_candidate_count=resolved_total,
     )
-
-
-async def _load_existing_catalog(
-    session: AsyncSession, *, exclude_slug: str, limit: int
-) -> list[tuple[str, list[str]]]:
-    """Подгрузить каталог уже существующих страниц для подсказки LLM.
-
-    Возвращает ``[(title, aliases), ...]``, исключая страницу ``exclude_slug``
-    (саму себя). При ``limit <= 0`` или пустой wiki вернёт пустой список —
-    тогда merge-prompt идёт без секции «Существующие сущности».
-    """
-    if limit <= 0:
-        return []
-    stmt = (
-        select(WikiPage.title, WikiPage.aliases)
-        .where(WikiPage.slug != exclude_slug)
-        .order_by(WikiPage.updated_at.desc())
-        .limit(limit)
-    )
-    rows = (await session.execute(stmt)).all()
-    return [(t, list(a or [])) for t, a in rows]
 
 
 async def _find_pages_by_alias(
@@ -387,7 +368,7 @@ async def _merge_group(
     statements = list(dict.fromkeys(statements))
 
     settings = get_settings()
-    existing_entities = await _load_existing_catalog(
+    existing_entities = await load_existing_catalog(
         session,
         exclude_slug=slug,
         limit=settings.merge_catalog_limit,
@@ -425,7 +406,7 @@ async def _merge_group(
         aliases=aliases,
     )
     # upsert_page внутри сделал flush — секции уже в БД, можно эмбеддить.
-    await _reembed_sections(session, page, embedder)
+    await reembed_sections(session, page, embedder)
     if forced_new:
         # Заметка: ``forced_new`` для логирования; upsert_page сам разбирается с
         # INSERT vs UPDATE. Тут ничего особенного делать не нужно.
@@ -533,50 +514,6 @@ async def _write_provenance(
     existing_pairs = {(sid, cid) for sid, cid in existing.all()}
     for sid, cid in pairs - existing_pairs:
         session.add(SectionProvenance(section_id=sid, source_chunk_id=cid))
-
-
-async def _reembed_sections(
-    session: AsyncSession, page: WikiPage, embedder: EmbeddingClient
-) -> None:
-    """Пересчитать ``wiki_section.embedding`` для всех секций страницы.
-
-    ``upsert_page`` стирает старые секции и вставляет новые без эмбеддингов —
-    поэтому здесь мы их добиваем. Эмбеддим текст ``page_title. section_title.
-    body_md`` — page-title даёт контекст для cross-page retrieval, body даёт
-    точное содержание.
-    """
-    sections = (
-        await session.execute(
-            select(WikiSection).where(WikiSection.page_id == page.id)
-        )
-    ).scalars().all()
-    if not sections:
-        return
-
-    texts = [_section_embed_text(page, s) for s in sections]
-    vectors = await _embed_batched(embedder, texts)
-    for sec, vec in zip(sections, vectors):
-        sec.embedding = vec
-    await session.flush()
-
-
-def _section_embed_text(page: WikiPage, section: WikiSection) -> str:
-    parts: list[str] = [page.title]
-    if section.title and section.title != page.title:
-        parts.append(section.title)
-    body = (section.body_md or "").strip()
-    if body:
-        parts.append(body)
-    return ". ".join(parts)
-
-
-async def _embed_batched(
-    embedder: EmbeddingClient, texts: list[str]
-) -> list[list[float]]:
-    out: list[list[float]] = []
-    for i in range(0, len(texts), _EMBED_BATCH_SIZE):
-        out.extend(await embedder.embed_many(texts[i : i + _EMBED_BATCH_SIZE]))
-    return out
 
 
 __all__ = [

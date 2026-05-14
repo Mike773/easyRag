@@ -184,6 +184,129 @@ def build_merge_user_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Back-link: добавить [[…]] ссылки на новые сущности в существующую страницу
+# ---------------------------------------------------------------------------
+
+WIKI_RELINK_TOOL_NAME = "relink_wiki_page"
+WIKI_RELINK_TOOL_DESCRIPTION = (
+    "Сохранить обновлённое тело wiki-страницы (markdown) после простановки "
+    "[[…]] ссылок на сущности из переданного каталога. Вызывать ровно один раз."
+)
+
+WIKI_RELINK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "body_md": {
+            "type": "string",
+            "description": (
+                "Полный markdown страницы. Содержимое и структура должны "
+                "совпадать с current_body, отличие — только в добавленных "
+                "[[Имя]] ссылках на сущности из каталога, упоминания которых "
+                "уже есть в тексте."
+            ),
+        },
+        "aliases": {
+            "type": "array",
+            "description": (
+                "Алиасы страницы. ВЕРНИ ТЕ ЖЕ, что переданы в current_aliases — "
+                "поле обязательно по схеме."
+            ),
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["body_md", "aliases"],
+    "additionalProperties": False,
+}
+
+
+WIKI_RELINK_SYSTEM = (
+    "Ты ведёшь wiki по сущностям. Тебе дают тело уже существующей страницы и "
+    "каталог других страниц wiki (title + aliases). Твоя задача — оборачивать "
+    "в [[Имя]] упоминания этих сущностей, которые УЖЕ присутствуют в текущем "
+    "теле страницы, и больше ничего не менять.\n"
+    "\n"
+    "ЖЁСТКИЕ ПРАВИЛА:\n"
+    "1. НЕ меняй формулировки, порядок слов, структуру секций, заголовки H2.\n"
+    "2. НЕ добавляй новых фактов, предложений, секций.\n"
+    "3. НЕ удаляй ничего из текущего тела — ни предложений, ни ссылок.\n"
+    "4. НЕ оборачивай в [[…]] упоминания САМОЙ этой страницы (её заголовок "
+    "указан в user-сообщении первым). Самореференция ломает граф ссылок.\n"
+    "5. Уже существующие [[…]] оставь как есть.\n"
+    "6. Если упоминание сущности из каталога стоит в тексте в склонённой форме, "
+    "оборачивай весь упомянутый токен в [[Имя из каталога|склонённая форма]] — "
+    "так читатель видит исходный текст, а граф знает целевой slug. Не "
+    "переписывай склонение в именительный.\n"
+    "7. Если ни одной сущности из каталога в теле нет — верни current_body "
+    "ровно как был передан.\n"
+    "8. НЕ выдумывай упоминаний и не вставляй сущности из каталога, которых "
+    "нет в исходном теле.\n"
+    "9. Поле aliases в ответе — те же значения, что в current_aliases.\n"
+    "10. Ответ — только через вызов tool relink_wiki_page."
+)
+
+
+def build_relink_user_prompt(
+    *,
+    title: str,
+    current_body: str,
+    current_aliases: Sequence[str],
+    catalog: Sequence[tuple[str, Sequence[str]]],
+) -> str:
+    """Собрать user-сообщение для relink-вызова.
+
+    ``catalog`` — список ``(title, aliases)`` всех других страниц wiki, на
+    которые можно ставить ссылки. Пустой каталог означает, что ставить нечего;
+    обычно в этом случае вызывать relink бессмысленно — фильтруйте до вызова.
+    """
+    title_clean = title.strip()
+    parts: list[str] = [
+        f"Заголовок страницы: {title_clean}\n"
+        f"ВАЖНО: НЕ оборачивай «{title_clean}» в [[…]] в тексте — это заголовок "
+        "САМОЙ страницы, на себя не ссылаемся."
+    ]
+
+    aliases_clean = [a.strip() for a in current_aliases if a and a.strip()]
+    if aliases_clean:
+        parts.append("Текущие алиасы (передай в ответе без изменений): " + ", ".join(aliases_clean))
+    else:
+        parts.append("Текущих алиасов нет — верни в ответе пустой массив.")
+
+    catalog_lines: list[str] = []
+    for ent_title, ent_aliases in catalog:
+        name = (ent_title or "").strip()
+        if not name:
+            continue
+        cleaned_aliases = [a.strip() for a in (ent_aliases or ()) if a and a.strip()]
+        if cleaned_aliases:
+            catalog_lines.append(f"- {name} (псевдонимы: {', '.join(cleaned_aliases)})")
+        else:
+            catalog_lines.append(f"- {name}")
+    if catalog_lines:
+        parts.append(
+            "Каталог сущностей (используй [[Имя]] точно по этому списку, если "
+            "упоминание встретилось в теле страницы):\n" + "\n".join(catalog_lines)
+        )
+    else:
+        parts.append("Каталог пуст — оборачивать нечего, верни тело без изменений.")
+
+    body_block = (current_body or "").strip()
+    if body_block:
+        parts.append(
+            "Текущее тело страницы (между тегами, итоговое тело должно "
+            "совпадать дословно, кроме добавленных [[…]] ссылок):\n"
+            f"<current_body>\n{body_block}\n</current_body>"
+        )
+    else:
+        parts.append("Текущего тела страницы нет — верни пустую строку.")
+
+    parts.append(
+        "Верни обновлённое тело и тот же набор алиасов вызовом tool "
+        f"{WIKI_RELINK_TOOL_NAME}."
+    )
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Ответ на запрос (query)
 # ---------------------------------------------------------------------------
 
@@ -305,6 +428,11 @@ __all__ = [
     "WIKI_MERGE_SYSTEM",
     "WIKI_MERGE_TOOL_DESCRIPTION",
     "WIKI_MERGE_TOOL_NAME",
+    "WIKI_RELINK_SCHEMA",
+    "WIKI_RELINK_SYSTEM",
+    "WIKI_RELINK_TOOL_DESCRIPTION",
+    "WIKI_RELINK_TOOL_NAME",
     "build_answer_user_prompt",
     "build_merge_user_prompt",
+    "build_relink_user_prompt",
 ]

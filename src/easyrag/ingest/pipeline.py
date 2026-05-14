@@ -22,12 +22,6 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Безопасный размер батча эмбеддингов:
-# OpenAI text-embedding-3-* принимает до 2048 input'ов за запрос; у GigaChat
-# лимит существенно ниже. 128 — компромисс, при котором обе модели работают
-# стабильно даже на длинных документах.
-_EMBED_BATCH_SIZE = 128
-
 from easyrag.config import get_settings
 from easyrag.db.models import EntityCandidate, SourceChunk, SourceDoc
 from easyrag.ingest.chunker import Chunk, chunk_text
@@ -39,6 +33,7 @@ from easyrag.ingest.extractor import (
 )
 from easyrag.llm.client import LLMClient
 from easyrag.llm.embeddings import EmbeddingClient, get_embeddings
+from easyrag.wiki.merge_utils import embed_batched
 
 
 @dataclass(frozen=True)
@@ -52,6 +47,7 @@ class IngestResult:
     merged_pages: tuple[str, ...] = field(default_factory=tuple)
     ambiguous_candidate_count: int = 0
     resolved_candidate_count: int = 0
+    relinked_pages: tuple[str, ...] = field(default_factory=tuple)
     domain_brief: DocumentBrief | None = None
 
 
@@ -65,6 +61,9 @@ async def ingest_text(
     embeddings: EmbeddingClient | None = None,
     resolve: bool = True,
     brief_window: int | None = None,
+    chunk_target_size: int | None = None,
+    chunk_max_size: int | None = None,
+    chunk_overlap: int | None = None,
 ) -> IngestResult:
     """Прогнать ``text`` через пайплайн и записать всё в БД.
 
@@ -110,6 +109,11 @@ async def ingest_text(
     # brief построить не удалось; extraction всё равно работает, но без подсказок.
     settings = get_settings()
     window = brief_window if brief_window is not None else settings.doc_brief_window
+    target_size = (
+        chunk_target_size if chunk_target_size is not None else settings.chunk_target_size
+    )
+    max_size = chunk_max_size if chunk_max_size is not None else settings.chunk_max_size
+    overlap = chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
     domain_brief: DocumentBrief | None = None
     if window > 0:
         domain_brief = await analyze_document(
@@ -118,7 +122,7 @@ async def ingest_text(
         if domain_brief is not None:
             doc.domain_brief = _serialize_brief(domain_brief)
 
-    chunks = chunk_text(text)
+    chunks = chunk_text(text, target_size=target_size, max_size=max_size, overlap=overlap)
     chunk_rows = await _persist_chunks(session, doc.id, chunks, embedder)
 
     entity_total = 0
@@ -148,10 +152,12 @@ async def ingest_text(
     merged_pages: tuple[str, ...] = ()
     ambiguous_count = 0
     resolved_count = 0
+    relinked_pages: tuple[str, ...] = ()
     if resolve and candidate_ids:
         # Импорт локально, чтобы избежать циклов: easyrag.query тянет wiki/repository,
         # который зависит от тех же db-моделей.
         from easyrag.query import resolve_candidates
+        from easyrag.wiki.backlinker import backfill_links
 
         summary = await resolve_candidates(
             session,
@@ -164,6 +170,18 @@ async def ingest_text(
         ambiguous_count = len(summary.ambiguous_candidate_ids)
         resolved_count = summary.resolved_candidate_count
 
+        # Back-link: проставить [[…]] в старых страницах, которые упоминают
+        # созданные/обновлённые в этом раунде сущности. Без этого граф
+        # связей знает только односторонние ссылки «новые → старые».
+        if settings.backlink_enabled:
+            backfill = await backfill_links(
+                session,
+                exclude_slugs=set(created_pages) | set(merged_pages),
+                llm=llm,
+                embeddings=embedder,
+            )
+            relinked_pages = backfill.relinked
+
     return IngestResult(
         doc_id=doc.id,
         chunk_count=len(chunk_rows),
@@ -174,18 +192,9 @@ async def ingest_text(
         merged_pages=merged_pages,
         ambiguous_candidate_count=ambiguous_count,
         resolved_candidate_count=resolved_count,
+        relinked_pages=relinked_pages,
         domain_brief=domain_brief,
     )
-
-
-async def _embed_batched(
-    embedder: EmbeddingClient, texts: list[str]
-) -> list[list[float]]:
-    """Эмбеддим длинные списки по частям — иначе провайдер ругнётся на лимит batch."""
-    out: list[list[float]] = []
-    for i in range(0, len(texts), _EMBED_BATCH_SIZE):
-        out.extend(await embedder.embed_many(texts[i : i + _EMBED_BATCH_SIZE]))
-    return out
 
 
 async def _persist_chunks(
@@ -196,7 +205,7 @@ async def _persist_chunks(
 ) -> list[SourceChunk]:
     if not chunks:
         return []
-    vectors = await _embed_batched(embedder, [c.text for c in chunks])
+    vectors = await embed_batched(embedder, [c.text for c in chunks])
     rows: list[SourceChunk] = []
     for chunk, vec in zip(chunks, vectors):
         row = SourceChunk(
@@ -222,7 +231,7 @@ async def _persist_entities(
     embedder: EmbeddingClient,
 ) -> list[UUID]:
     texts = [_embed_text(e) for e in extracted]
-    vectors = await _embed_batched(embedder, texts)
+    vectors = await embed_batched(embedder, texts)
     rows: list[EntityCandidate] = []
     for ent, vec in zip(extracted, vectors):
         row = EntityCandidate(

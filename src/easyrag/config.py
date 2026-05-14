@@ -68,11 +68,30 @@ class Settings(BaseSettings):
     # для построения domain brief. Brief считается один раз на ingest.
     doc_brief_window: int = 4000
 
+    # Параметры чанкера (chars). См. easyrag.ingest.chunker.chunk_text.
+    # target_size — мягкая цель группировки коротких абзацев;
+    # max_size — жёсткий потолок на отдельный абзац (длиннее режется с overlap);
+    # overlap применяется только к принудительным срезам внутри длинных абзацев.
+    chunk_target_size: int = 1200
+    chunk_max_size: int = 1800
+    chunk_overlap: int = 150
+
     # Сколько уже существующих страниц передавать в merge-prompt как каталог
     # сущностей, на которые LLM должен ссылаться через [[…]]. На больших wiki
     # имеет смысл отбирать top-K по similarity — пока считаем, что для текущего
     # масштаба простой лимит достаточен.
     merge_catalog_limit: int = 300
+
+    # Back-link: после каждого resolve_candidates пройтись по существующим
+    # страницам и попросить LLM добавить [[…]] ссылки на сущности, появившиеся
+    # в этом раунде (см. easyrag.wiki.backlinker). Без этого старые страницы
+    # никогда не узнают о новых соседях.
+    backlink_enabled: bool = True
+    # Pre-filter: пропускать страницу, если в её body_md нет ни одного
+    # substring-совпадения с title/alias свежих сущностей. Экономит LLM-вызовы
+    # при «холостых» проходах. На сильно склоняющихся языках (русский) может
+    # давать ложные пропуски — тогда выключай.
+    backlink_prefilter: bool = True
 
 
 @lru_cache(maxsize=1)
