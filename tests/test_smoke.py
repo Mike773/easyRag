@@ -4,6 +4,7 @@ import pytest
 from easyrag.config import get_settings
 from easyrag.llm.client import LLMClient
 from easyrag.llm.embeddings import EmbeddingClient
+from easyrag.wiki.backlinker import BackfillResult, backfill_links
 
 
 def test_settings_load():
@@ -12,6 +13,34 @@ def test_settings_load():
     assert s.llm_provider in {"openai", "gigachat"}
     assert s.embed_provider in {"openai", "gigachat"}
     assert "asyncpg" in s.db_dsn
+
+
+def test_backlinker_public_api():
+    # Регресс-якорь: backfill_links и BackfillResult импортируются и совместимы
+    # с конфиг-флагом — отключённый backlink_enabled даёт пустой результат
+    # без обращения к БД/LLM.
+    import asyncio
+
+    assert callable(backfill_links)
+    assert BackfillResult().relinked == ()
+    assert BackfillResult().skipped == ()
+    assert BackfillResult().relinked_count == 0
+
+    # При выключенном backlink_enabled функция возвращает пустой результат
+    # сразу — даже без session: до запроса к БД не доходим.
+    import easyrag.wiki.backlinker as bl
+    from easyrag.config import get_settings
+
+    settings = get_settings()
+    original = settings.backlink_enabled
+    settings.backlink_enabled = False
+    try:
+        out = asyncio.run(
+            bl.backfill_links(session=None, exclude_slugs=("a", "b"))  # type: ignore[arg-type]
+        )
+        assert out == BackfillResult()
+    finally:
+        settings.backlink_enabled = original
 
 
 def test_models_import():

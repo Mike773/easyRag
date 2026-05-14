@@ -63,12 +63,42 @@ def status() -> None:
         "Поставьте 0, чтобы пропустить шаг brief (extraction пойдёт без подсказок)."
     ),
 )
+@click.option(
+    "--chunk-size",
+    type=int,
+    default=None,
+    help=(
+        "Целевой размер чанка (chars). По умолчанию — EASYRAG_CHUNK_TARGET_SIZE (1200). "
+        "Может быть превышен, если в чанк сгруппировано несколько коротких абзацев."
+    ),
+)
+@click.option(
+    "--chunk-max-size",
+    type=int,
+    default=None,
+    help=(
+        "Жёсткий потолок на отдельный абзац (chars). По умолчанию — "
+        "EASYRAG_CHUNK_MAX_SIZE (1800). Длиннее — режется с overlap."
+    ),
+)
+@click.option(
+    "--chunk-overlap",
+    type=int,
+    default=None,
+    help=(
+        "Overlap между принудительными срезами длинного абзаца (chars). "
+        "По умолчанию — EASYRAG_CHUNK_OVERLAP (150)."
+    ),
+)
 def ingest_cmd(
     uri: str,
     file_path: Path,
     mime: str | None,
     no_resolve: bool,
     brief_window: int | None,
+    chunk_size: int | None,
+    chunk_max_size: int | None,
+    chunk_overlap: int | None,
 ) -> None:
     """Прочитать файл, нарезать на чанки, извлечь сущности и материализовать wiki."""
     text = file_path.read_text(encoding="utf-8")
@@ -82,6 +112,9 @@ def ingest_cmd(
             mime=resolved_mime,
             resolve=not no_resolve,
             brief_window=window,
+            chunk_target_size=chunk_size,
+            chunk_max_size=chunk_max_size,
+            chunk_overlap=chunk_overlap,
         )
     )
     prefix = "already ingested" if result.deduplicated else "ingested"
@@ -99,6 +132,8 @@ def ingest_cmd(
             click.echo("  new pages: " + ", ".join(result.created_pages))
         if result.merged_pages:
             click.echo("  merged into: " + ", ".join(result.merged_pages))
+        if result.relinked_pages:
+            click.echo("  relinked: " + ", ".join(result.relinked_pages))
 
 
 @cli.command("query")
@@ -145,6 +180,28 @@ def query_cmd(question: str, top_k: int, no_graph: bool, show_sources: bool) -> 
         click.echo("\n(в wiki не нашлось данных для уверенного ответа)")
 
 
+@cli.command("relink")
+def relink_cmd() -> None:
+    """Прогнать relink по всей wiki без нового ingest'а.
+
+    Полезно после ручных правок страниц или для дотягивания пропущенных
+    ссылок. Honoр-ит ``EASYRAG_BACKLINK_ENABLED`` (выключен → no-op).
+    """
+    result = asyncio.run(_run_relink())
+    click.echo(
+        f"relinked={result.relinked_count} skipped={result.skipped_count}"
+    )
+    if result.relinked:
+        click.echo("  relinked: " + ", ".join(result.relinked))
+
+
+async def _run_relink():
+    from easyrag.wiki.backlinker import backfill_links
+
+    async with session_scope() as session:
+        return await backfill_links(session, force=True)
+
+
 async def _run_ingest(
     *,
     uri: str,
@@ -152,6 +209,9 @@ async def _run_ingest(
     mime: str | None,
     resolve: bool,
     brief_window: int,
+    chunk_target_size: int | None,
+    chunk_max_size: int | None,
+    chunk_overlap: int | None,
 ):
     async with session_scope() as session:
         return await ingest_text(
@@ -161,6 +221,9 @@ async def _run_ingest(
             mime=mime,
             resolve=resolve,
             brief_window=brief_window,
+            chunk_target_size=chunk_target_size,
+            chunk_max_size=chunk_max_size,
+            chunk_overlap=chunk_overlap,
         )
 
 
