@@ -59,8 +59,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("EMBED_BASE_URL", "EASYRAG_EMBED_BASE_URL"),
     )
 
+    # Резолвер: эмбеддинги кандидатов считаются по чистому ``name``
+    # (см. ingest.pipeline._embed_text), поэтому пороги ниже, чем были бы для
+    # ``name. descriptor``. Зона между low и high — LLM-судья.
+    # high≥thresh_high → уверенный merge без LLM; <thresh_low → уверенно новая;
+    # между — судья смотрит на top-N страниц и решает.
     resolve_thresh_high: float = 0.85
-    resolve_thresh_low: float = 0.65
+    resolve_thresh_low: float = 0.45
     abbr_thresh_high: float = 0.80
     graph_expand_thresh: float = 0.55
 

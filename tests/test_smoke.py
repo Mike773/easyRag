@@ -95,12 +95,15 @@ async def test_embed_mock_dim_and_determinism():
     assert len(v1) == get_settings().embed_dim
 
     def _cos(a: list[float], b: list[float]) -> float:
-        return sum(x * y for x, y in zip(a, b))
+        # Полноценный косинус: GigaChat-эмбеддинги не L2-нормированы
+        # (в отличие от моков и OpenAI), а голое скалярное произведение
+        # совпадает с косинусом только для единичных векторов.
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(x * x for x in b) ** 0.5
+        return dot / (na * nb) if na and nb else 0.0
 
-    # Тот же текст — близкие векторы (моки точно равны, OpenAI ≈ равны).
+    # Тот же текст — близкие векторы (моки точно равны, реальные ≈ равны).
     assert _cos(v1, v2) > 0.999
     # Разные тексты — заметно расходятся.
     assert _cos(v1, v3) < 0.95
-    # норма ≈ 1
-    s = sum(x * x for x in v1) ** 0.5
-    assert abs(s - 1.0) < 1e-2

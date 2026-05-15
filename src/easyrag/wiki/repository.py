@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import cast
 
@@ -24,6 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from easyrag.db.models import WikiLink, WikiPage, WikiSection
 from easyrag.wiki.markdown import ParsedPage, parse_page
+from easyrag.wiki.sanitize import sanitize_body_md
+
+logger = logging.getLogger(__name__)
 
 
 async def upsert_page(
@@ -47,6 +51,13 @@ async def upsert_page(
       тип, передайте пустую строку (а не ``None``).
     """
     aliases_list = list(aliases)
+    body_md, repairs = sanitize_body_md(body_md, page_slug=slug)
+    if repairs:
+        logger.warning(
+            "upsert_page sanitized body_md for %s: %s",
+            slug,
+            "; ".join(repairs),
+        )
     parsed = parse_page(body_md)
 
     page = (

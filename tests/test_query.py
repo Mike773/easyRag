@@ -66,7 +66,7 @@ def test_build_answer_prompt_includes_sections_and_question():
         sections=sections,  # type: ignore[arg-type]
     )
     assert "Кто стороны договора?" in prompt
-    assert "[dogovor#storony]" in prompt
+    assert "[slug=dogovor | anchor=storony]" in prompt
     assert "Тело про стороны." in prompt
     # Структурные теги-обёртки сохранились.
     assert "<sections>" in prompt and "</sections>" in prompt

@@ -34,9 +34,11 @@
 """
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from uuid import UUID
 
 from sqlalchemy import select, text
@@ -54,11 +56,16 @@ from easyrag.db.models import (
 from easyrag.llm.client import LLMClient, get_llm
 from easyrag.llm.embeddings import EmbeddingClient, get_embeddings
 from easyrag.query.prompts import (
+    RESOLVE_JUDGE_SCHEMA,
+    RESOLVE_JUDGE_SYSTEM,
+    RESOLVE_JUDGE_TOOL_DESCRIPTION,
+    RESOLVE_JUDGE_TOOL_NAME,
     WIKI_MERGE_SCHEMA,
     WIKI_MERGE_SYSTEM,
     WIKI_MERGE_TOOL_DESCRIPTION,
     WIKI_MERGE_TOOL_NAME,
     build_merge_user_prompt,
+    build_resolve_judge_user_prompt,
 )
 from easyrag.wiki.markdown import make_slug, strip_self_links
 from easyrag.wiki.merge_utils import (
@@ -66,6 +73,8 @@ from easyrag.wiki.merge_utils import (
     reembed_sections,
 )
 from easyrag.wiki.repository import upsert_page
+
+logger = logging.getLogger(__name__)
 
 # Аннотация целевой страницы при резолве кандидата.
 #   target == "new"        → создаём новую страницу с slug = candidate_slug
@@ -75,6 +84,22 @@ from easyrag.wiki.repository import upsert_page
 _TARGET_NEW = "new"
 _TARGET_EXISTING = "existing"
 _TARGET_AMBIGUOUS = "ambiguous"
+
+# Векторный матчинг: сколько секций тянем из БД, чтобы агрегировать в top-N
+# страниц-кандидатов; сколько страниц показываем LLM-судье в ambiguous-зоне.
+_JUDGE_SECTION_LIMIT = 30
+_JUDGE_PAGE_LIMIT = 5
+# Сколько лексически-похожих страниц добавляем поверх векторных (по difflib
+# ratio имени кандидата против page.title / aliases). Это закрывает кейсы,
+# где векторное сходство name-only низкое, но имя страницы лексически очень
+# близко: «Мышка-норушка» vs «Мышка», «Медведь косолапый» vs «Медведь».
+_JUDGE_LEXICAL_LIMIT = 3
+_JUDGE_LEXICAL_THRESH = 0.35
+# Общий потолок опций для судьи — больше уже раздувает prompt.
+_JUDGE_OPTIONS_TOTAL = 7
+# Сколько символов из body_md показывать судье — достаточно, чтобы понять
+# суть, но не раздувать prompt.
+_JUDGE_BODY_EXCERPT_CHARS = 400
 
 
 @dataclass(frozen=True)
@@ -129,6 +154,7 @@ async def resolve_candidates(
             candidate=c,
             thresh_high=settings.resolve_thresh_high,
             thresh_low=settings.resolve_thresh_low,
+            llm=llm_client,
         )
         outcomes.append(outcome)
 
@@ -228,11 +254,24 @@ async def _resolve_target(
     candidate: EntityCandidate,
     thresh_high: float,
     thresh_low: float,
+    llm: LLMClient,
 ) -> ResolveOutcome:
-    """Подобрать целевой slug для одного кандидата."""
+    """Подобрать целевой slug для одного кандидата.
+
+    Маршрутизация:
+
+    1. exact slug match — самое сильное доказательство.
+    2. alias match (одно совпадение) — следующий уровень.
+    3. векторный top-K по wiki_section, агрегированный в top-N страниц:
+       * top-1 sim ≥ thresh_high → EXISTING (уверенный merge);
+       * top-1 sim < thresh_low → NEW (уверенно новая сущность);
+       * thresh_low ≤ top-1 sim < thresh_high → LLM-судья смотрит на top-N
+         кандидатов и решает: existing/new/ambiguous. Если решить не удалось,
+         откладываем как ambiguous (лучше отложить, чем слить разные сущности).
+    """
     candidate_slug = make_slug(candidate.name)
 
-    # 1. Точное совпадение slug'а — самое сильное доказательство, что это та же сущность.
+    # 1. Точное совпадение slug'а.
     existing = (
         await session.execute(select(WikiPage).where(WikiPage.slug == candidate_slug))
     ).scalar_one_or_none()
@@ -245,12 +284,7 @@ async def _resolve_target(
             similarity=1.0,
         )
 
-    # 1.5. Точное (case-insensitive) совпадение с одним из алиасов существующей страницы.
-    # Помогает склеить cross-chunk варианты имени, которые дают разные slug'и
-    # ("Acme" vs "Acme Corp"): если LLM в предыдущем merge положил вариант в
-    # wiki_page.aliases, новый кандидат с этим вариантом теперь сольётся в ту же
-    # страницу, а не породит дубль. При >1 совпадении (страницы с пересекающимися
-    # алиасами — сигнал неконсистентности) уходим в обычный embedding-flow.
+    # 1.5. Точное (case-insensitive) совпадение с одним из алиасов.
     alias_match = await _find_pages_by_alias(session, candidate.name)
     if len(alias_match) == 1:
         page_id, slug = alias_match[0]
@@ -262,9 +296,8 @@ async def _resolve_target(
             similarity=1.0,
         )
 
-    # 2. Vector top-1 по wiki_section: берём страницу с минимальной distance.
+    # 2. Вектор: без эмбеддинга — создаём новую страницу.
     if candidate.embedding is None:
-        # Без эмбеддинга сравнить не с чем — создаём новую страницу.
         return ResolveOutcome(
             candidate_id=candidate.id,
             target=_TARGET_NEW,
@@ -273,61 +306,231 @@ async def _resolve_target(
             similarity=None,
         )
 
+    # 2.1. Векторный top-K секций → агрегируем по максимальной similarity на
+    #      страницу → top-N страниц-претендентов.
     distance = WikiSection.embedding.cosine_distance(candidate.embedding)
     stmt = (
         select(WikiSection.page_id, distance.label("dist"))
         .where(WikiSection.embedding.is_not(None))
         .order_by(distance.asc())
-        .limit(1)
+        .limit(_JUDGE_SECTION_LIMIT)
     )
-    row = (await session.execute(stmt)).first()
-    if row is None:
-        return ResolveOutcome(
-            candidate_id=candidate.id,
-            target=_TARGET_NEW,
-            page_slug=candidate_slug,
-            page_id=None,
-            similarity=None,
-        )
+    rows = (await session.execute(stmt)).all()
+    best_by_page: dict[UUID, float] = {}
+    for page_id, dist in rows:
+        d = float(dist)
+        prev = best_by_page.get(page_id)
+        if prev is None or d < prev:
+            best_by_page[page_id] = d
+    sorted_vector = sorted(best_by_page.items(), key=lambda kv: kv[1])[:_JUDGE_PAGE_LIMIT]
+    top_sim = (1.0 - sorted_vector[0][1]) if sorted_vector else 0.0
+    top_page_id = sorted_vector[0][0] if sorted_vector else None
 
-    best_page_id, best_distance = row
-    similarity = 1.0 - float(best_distance)
-
-    if similarity >= thresh_high:
-        page = await session.get(WikiPage, best_page_id)
+    # 2.2. Уверенный merge: top-1 уже выше HIGH порога — не зовём судью.
+    if top_page_id is not None and top_sim >= thresh_high:
+        page = await session.get(WikiPage, top_page_id)
         if page is None:
-            # Гонка / битая ссылка — fallback на новую страницу.
             return ResolveOutcome(
                 candidate_id=candidate.id,
                 target=_TARGET_NEW,
                 page_slug=candidate_slug,
                 page_id=None,
-                similarity=similarity,
+                similarity=top_sim,
             )
         return ResolveOutcome(
             candidate_id=candidate.id,
             target=_TARGET_EXISTING,
             page_slug=page.slug,
             page_id=page.id,
-            similarity=similarity,
+            similarity=top_sim,
         )
 
-    if similarity >= thresh_low:
+    # 2.3. Лексический pre-step: страницы с высоким difflib-ratio имени против
+    #      title/aliases. Закрывает кейсы, где синонимы лексически близки, но
+    #      vector top-N их не подтянул (напр., «Мышка-норушка» ↔ «Мышка»).
+    lexical_matches = await _lexical_candidates(session, candidate.name)
+    has_strong_lexical = bool(lexical_matches)
+
+    # 2.4. Если нет ни вектор-кандидатов с sim ≥ LOW, ни лексических — уверенно
+    #      новая сущность.
+    if top_sim < thresh_low and not has_strong_lexical:
+        return ResolveOutcome(
+            candidate_id=candidate.id,
+            target=_TARGET_NEW,
+            page_slug=candidate_slug,
+            page_id=None,
+            similarity=top_sim if sorted_vector else None,
+        )
+
+    # 2.5. Собираем опции для судьи: vector top-N + лексические, дедуплицируем
+    #      по page_id, обрезаем по общему лимиту.
+    page_ids_ordered: list[UUID] = []
+    seen: set[UUID] = set()
+    for pid, _ in sorted_vector:
+        if pid not in seen:
+            seen.add(pid)
+            page_ids_ordered.append(pid)
+    for pid, _ in lexical_matches:
+        if pid not in seen and len(page_ids_ordered) < _JUDGE_OPTIONS_TOTAL:
+            seen.add(pid)
+            page_ids_ordered.append(pid)
+    page_ids_ordered = page_ids_ordered[:_JUDGE_OPTIONS_TOTAL]
+
+    pages_by_id = await _load_pages_by_ids(session, page_ids_ordered)
+    options: list[tuple[str, str, list[str], str]] = []
+    for pid in page_ids_ordered:
+        page = pages_by_id.get(pid)
+        if page is None:
+            continue
+        body_excerpt = (page.body_md or "")[:_JUDGE_BODY_EXCERPT_CHARS]
+        options.append(
+            (page.slug, page.title, list(page.aliases or []), body_excerpt)
+        )
+    if not options:
+        return ResolveOutcome(
+            candidate_id=candidate.id,
+            target=_TARGET_NEW if top_sim < thresh_low else _TARGET_AMBIGUOUS,
+            page_slug=candidate_slug if top_sim < thresh_low else None,
+            page_id=None,
+            similarity=top_sim if sorted_vector else None,
+        )
+
+    decision, decided_slug = await _judge_target(
+        llm=llm,
+        candidate=candidate,
+        options=options,
+    )
+    logger.info(
+        "resolver judge candidate=%r top_sim=%.3f decision=%s slug=%s options=%s",
+        candidate.name, top_sim, decision, decided_slug,
+        [s for s, _, _, _ in options],
+    )
+    if decision == "existing" and decided_slug:
+        match = next((p for p in pages_by_id.values() if p.slug == decided_slug), None)
+        if match is not None:
+            return ResolveOutcome(
+                candidate_id=candidate.id,
+                target=_TARGET_EXISTING,
+                page_slug=match.slug,
+                page_id=match.id,
+                similarity=top_sim,
+            )
+        # Судья выдал slug, которого не было в опциях — защита от галлюцинации.
         return ResolveOutcome(
             candidate_id=candidate.id,
             target=_TARGET_AMBIGUOUS,
             page_slug=None,
             page_id=None,
-            similarity=similarity,
+            similarity=top_sim,
         )
-
+    if decision == "new":
+        return ResolveOutcome(
+            candidate_id=candidate.id,
+            target=_TARGET_NEW,
+            page_slug=candidate_slug,
+            page_id=None,
+            similarity=top_sim,
+        )
+    # decision == "ambiguous" или ошибка/мусор.
     return ResolveOutcome(
         candidate_id=candidate.id,
-        target=_TARGET_NEW,
-        page_slug=candidate_slug,
+        target=_TARGET_AMBIGUOUS,
+        page_slug=None,
         page_id=None,
-        similarity=similarity,
+        similarity=top_sim,
     )
+
+
+async def _load_pages_by_ids(
+    session: AsyncSession, page_ids: list[UUID]
+) -> dict[UUID, WikiPage]:
+    if not page_ids:
+        return {}
+    rows = (
+        await session.execute(select(WikiPage).where(WikiPage.id.in_(page_ids)))
+    ).scalars().all()
+    return {p.id: p for p in rows}
+
+
+async def _lexical_candidates(
+    session: AsyncSession, name: str
+) -> list[tuple[UUID, float]]:
+    """Найти страницы, лексически близкие к ``name`` (по difflib-ratio).
+
+    Сканирует все страницы, считает максимум по ratio(title) и ratio(alias),
+    оставляет те, у кого ratio ≥ ``_JUDGE_LEXICAL_THRESH``, и возвращает
+    top-``_JUDGE_LEXICAL_LIMIT`` по убыванию.
+
+    Дешёвый O(N) скан по wiki_page — без вектора, без LLM. На больших wiki
+    стоит заменить trigram-индексом, но при текущем масштабе достаточно.
+    """
+    cand_lower = (name or "").strip().casefold()
+    if not cand_lower:
+        return []
+    rows = (
+        await session.execute(select(WikiPage.id, WikiPage.title, WikiPage.aliases))
+    ).all()
+    scored: list[tuple[UUID, float]] = []
+    for pid, title, aliases in rows:
+        title_lower = (title or "").strip().casefold()
+        ratio = SequenceMatcher(None, cand_lower, title_lower).ratio() if title_lower else 0.0
+        for alias in (aliases or ()):
+            alias_lower = (alias or "").strip().casefold()
+            if not alias_lower:
+                continue
+            r = SequenceMatcher(None, cand_lower, alias_lower).ratio()
+            if r > ratio:
+                ratio = r
+        if ratio >= _JUDGE_LEXICAL_THRESH:
+            scored.append((pid, ratio))
+    scored.sort(key=lambda kv: kv[1], reverse=True)
+    return scored[:_JUDGE_LEXICAL_LIMIT]
+
+
+async def _judge_target(
+    *,
+    llm: LLMClient,
+    candidate: EntityCandidate,
+    options: list[tuple[str, str, list[str], str]],
+) -> tuple[str, str | None]:
+    """Спросить LLM, является ли кандидат одной из ``options`` или это новая.
+
+    Возвращает кортеж ``(decision, slug)``. ``decision`` — одно из
+    ``{"existing","new","ambiguous"}``. ``slug`` валиден только при ``existing``.
+    На любую ошибку или мусорный ответ возвращает ``("ambiguous", None)`` —
+    сейф: лучше отложить кандидата, чем создать дубль.
+    """
+    valid_slugs = {slug for slug, _, _, _ in options}
+    user_prompt = build_resolve_judge_user_prompt(
+        candidate_name=candidate.name or "",
+        candidate_descriptor=candidate.descriptor or "",
+        candidate_statements=list(candidate.statements or []),
+        options=options,
+    )
+    try:
+        raw = await llm.call_json(
+            system=RESOLVE_JUDGE_SYSTEM,
+            user=user_prompt,
+            tool_name=RESOLVE_JUDGE_TOOL_NAME,
+            tool_description=RESOLVE_JUDGE_TOOL_DESCRIPTION,
+            input_schema=RESOLVE_JUDGE_SCHEMA,
+        )
+    except Exception:
+        return ("ambiguous", None)
+    if not isinstance(raw, dict):
+        return ("ambiguous", None)
+    decision = raw.get("decision")
+    if decision not in ("existing", "new", "ambiguous"):
+        return ("ambiguous", None)
+    if decision == "existing":
+        slug = raw.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            return ("ambiguous", None)
+        slug = slug.strip()
+        if slug not in valid_slugs:
+            return ("ambiguous", None)
+        return ("existing", slug)
+    return (decision, None)
 
 
 async def _merge_group(
