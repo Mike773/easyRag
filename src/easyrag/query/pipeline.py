@@ -190,6 +190,14 @@ def _coerce_citations(raw: Any) -> list[tuple[str, str]]:
             continue
         slug = slug.strip()
         anchor = anchor.strip()
+        # Защита от LLM, склеивающих заголовок "slug#anchor" в поле anchor:
+        # сам anchor никогда не содержит '#', так что хвост после последнего
+        # '#' — это настоящий якорь, а голова — slug (если поле slug пустое).
+        if "#" in anchor:
+            head, _, tail = anchor.rpartition("#")
+            anchor = tail.strip()
+            if not slug:
+                slug = head.strip()
         if not slug or not anchor:
             continue
         key = (slug, anchor)

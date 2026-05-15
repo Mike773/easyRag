@@ -338,8 +338,17 @@ ANSWER_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "slug": {"type": "string"},
-                    "anchor": {"type": "string"},
+                    "slug": {
+                        "type": "string",
+                        "description": "Значение после 'slug=' в заголовке секции, дословно.",
+                    },
+                    "anchor": {
+                        "type": "string",
+                        "description": (
+                            "Значение после 'anchor=' в заголовке секции, дословно. "
+                            "Только сам anchor — без slug и без символа '#'."
+                        ),
+                    },
                 },
                 "required": ["slug", "anchor"],
                 "additionalProperties": False,
@@ -353,8 +362,8 @@ ANSWER_SCHEMA: dict[str, Any] = {
 
 ANSWER_SYSTEM = (
     "Ты отвечаешь на вопросы пользователя по внутренней бизнес-wiki. "
-    "Тебе дают набор секций wiki (каждая помечена заголовком "
-    "[slug#anchor] Название). Это ЕДИНСТВЕННЫЙ источник истины для ответа.\n"
+    "Тебе дают набор секций wiki (каждая помечена заголовком вида "
+    "[slug=… | anchor=…] Название). Это ЕДИНСТВЕННЫЙ источник истины для ответа.\n"
     "\n"
     "ПРАВИЛА:\n"
     "1. Используй ТОЛЬКО факты из предоставленных секций. Никаких догадок, "
@@ -364,7 +373,10 @@ ANSWER_SYSTEM = (
     "3. Если ответ есть, он должен быть кратким и по делу. Без вступлений типа "
     "'согласно предоставленным данным'.\n"
     "4. В citations включай только те секции, факты из которых ты реально "
-    "использовал в ответе. Не дублируй цитаты на одну и ту же секцию.\n"
+    "использовал в ответе. Не дублируй цитаты на одну и ту же секцию. "
+    "В каждой цитате поле slug — это значение после 'slug=' в заголовке "
+    "секции, поле anchor — значение после 'anchor='. Копируй их дословно по "
+    "отдельности; не склеивай в одну строку и не добавляй '#'.\n"
     "5. НЕ упоминай ID секций, slug'и, anchor'ы в самом тексте ответа — это "
     "метаданные, они уходят отдельно в поле citations.\n"
     "6. Ответ — только через вызов tool save_answer. Свободный текст игнорируется."
@@ -388,7 +400,10 @@ def build_answer_user_prompt(
     else:
         chunks: list[str] = []
         for sec in sections:
-            header = f"[{sec.slug}#{sec.anchor}] {sec.page_title} → {sec.section_title}"
+            header = (
+                f"[slug={sec.slug} | anchor={sec.anchor}] "
+                f"{sec.page_title} → {sec.section_title}"
+            )
             body = (sec.body_md or "").strip()
             if body:
                 chunks.append(f"{header}\n{body}")
@@ -418,12 +433,129 @@ class AnsweredSection:  # noqa: D401 — protocol-like заглушка
     body_md: str
 
 
+# ---------------------------------------------------------------------------
+# Решение резолвера в ambiguous-зоне (LLM-судья)
+# ---------------------------------------------------------------------------
+
+RESOLVE_JUDGE_TOOL_NAME = "decide_entity_target"
+RESOLVE_JUDGE_TOOL_DESCRIPTION = (
+    "Решить, является ли кандидат-сущность той же, что одна из показанных "
+    "wiki-страниц, либо новой сущностью."
+)
+
+RESOLVE_JUDGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "decision": {
+            "type": "string",
+            "enum": ["existing", "new", "ambiguous"],
+            "description": (
+                "existing — кандидат и одна из показанных страниц — одна и "
+                "та же сущность; new — новая сущность; ambiguous — нельзя "
+                "решить уверенно."
+            ),
+        },
+        "slug": {
+            "type": "string",
+            "description": (
+                "Slug выбранной страницы. Обязателен ТОЛЬКО если "
+                "decision=existing — и должен быть строго одним из slug'ов, "
+                "перечисленных в user-сообщении."
+            ),
+        },
+        "reasoning": {
+            "type": "string",
+            "description": "1-2 коротких предложения с обоснованием решения.",
+        },
+    },
+    "required": ["decision", "reasoning"],
+    "additionalProperties": False,
+}
+
+
+RESOLVE_JUDGE_SYSTEM = (
+    "Тебе дают одного кандидата-сущность (имя, описание, факты) и небольшой "
+    "список существующих wiki-страниц. Реши, ссылается ли кандидат на ту же "
+    "реальную сущность, что одна из показанных страниц.\n"
+    "\n"
+    "ПРАВИЛА:\n"
+    "1. existing — выбирай только если ты УВЕРЕН, что это синонимы/варианты "
+    "одного и того же объекта: разные имена одного и того же персонажа, "
+    "разные написания одного и того же названия, полное и сокращённое имя "
+    "одной и той же сущности. Укажи slug этой страницы.\n"
+    "2. new — если ни одна из показанных страниц явно не та же сущность.\n"
+    "3. ambiguous — если данных недостаточно, чтобы решить уверенно. "
+    "Лучше отложить, чем слить разные сущности.\n"
+    "4. Близость имён ≠ та же сущность. Опирайся на описание и факты, а не "
+    "только на буквенное сходство. Однофамильцы, тёзки, разные объекты "
+    "с похожими названиями — всё это разные сущности.\n"
+    "5. slug в ответе должен быть строго одним из slug'ов, показанных в "
+    "user-сообщении. Не выдумывай и не пиши новый slug.\n"
+    "6. Ответ — только через вызов tool decide_entity_target."
+)
+
+
+def build_resolve_judge_user_prompt(
+    *,
+    candidate_name: str,
+    candidate_descriptor: str,
+    candidate_statements: Sequence[str],
+    options: Sequence[tuple[str, str, Sequence[str], str]],
+) -> str:
+    """Собрать user-сообщение для LLM-судьи.
+
+    ``options`` — список ``(slug, title, aliases, body_excerpt)`` для top-N
+    страниц-претендентов, полученных по векторному сходству. Порядок —
+    по убыванию похожести; модель видит лучших кандидатов первыми.
+    """
+    parts: list[str] = [
+        "Кандидат-сущность:",
+        f"- Имя: {candidate_name.strip() or '(пусто)'}",
+    ]
+    descriptor_clean = (candidate_descriptor or "").strip()
+    if descriptor_clean:
+        parts.append(f"- Описание: {descriptor_clean}")
+    statements_clean = [s.strip() for s in candidate_statements if s and s.strip()]
+    if statements_clean:
+        bullets = "\n".join(f"  - {s}" for s in statements_clean)
+        parts.append("- Факты:\n" + bullets)
+
+    if not options:
+        parts.append(
+            "Существующих страниц-претендентов нет. Реши: new (если кандидат "
+            "осмыслен) или ambiguous (если данных мало)."
+        )
+    else:
+        parts.append("Существующие wiki-страницы-претенденты (в порядке релевантности):")
+        for slug, title, aliases, body_excerpt in options:
+            slug_clean = slug.strip()
+            title_clean = (title or "").strip()
+            aliases_clean = [a.strip() for a in (aliases or ()) if a and a.strip()]
+            header = f"- slug={slug_clean} | title={title_clean}"
+            if aliases_clean:
+                header += f" | aliases: {', '.join(aliases_clean)}"
+            parts.append(header)
+            body_clean = (body_excerpt or "").strip()
+            if body_clean:
+                parts.append(f"  выдержка: {body_clean}")
+
+    parts.append(
+        "Реши: existing (укажи slug) / new / ambiguous и верни решение "
+        f"вызовом tool {RESOLVE_JUDGE_TOOL_NAME}."
+    )
+    return "\n\n".join(parts)
+
+
 __all__ = [
     "ANSWER_SCHEMA",
     "ANSWER_SYSTEM",
     "ANSWER_TOOL_DESCRIPTION",
     "ANSWER_TOOL_NAME",
     "AnsweredSection",
+    "RESOLVE_JUDGE_SCHEMA",
+    "RESOLVE_JUDGE_SYSTEM",
+    "RESOLVE_JUDGE_TOOL_DESCRIPTION",
+    "RESOLVE_JUDGE_TOOL_NAME",
     "WIKI_MERGE_SCHEMA",
     "WIKI_MERGE_SYSTEM",
     "WIKI_MERGE_TOOL_DESCRIPTION",
@@ -435,4 +567,5 @@ __all__ = [
     "build_answer_user_prompt",
     "build_merge_user_prompt",
     "build_relink_user_prompt",
+    "build_resolve_judge_user_prompt",
 ]
